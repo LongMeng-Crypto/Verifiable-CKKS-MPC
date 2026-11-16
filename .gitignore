@@ -1,0 +1,7 @@
+/vendor/
+/target/
+/artifacts/
+/.cargo-cache/
+/docs/
+/reports/
+__pycache__/

@@ -1,0 +1,7 @@
+[workspace]
+members = ["crates/mpc"]
+exclude = ["vendor/Plonky3"]
+resolver = "3"
+
+[profile.release]
+debug = 1

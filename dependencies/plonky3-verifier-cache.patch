@@ -1,0 +1,273 @@
+diff --git a/batch-stark/src/error.rs b/batch-stark/src/error.rs
+index e72dc7f89531f926a2a5af0efe817346bb58d76f..a10fa71cb82b1000b11dbf4234ef90791feff664 100644
+--- a/batch-stark/src/error.rs
++++ b/batch-stark/src/error.rs
+@@ -24,6 +24,13 @@ pub enum BatchVerificationError<PcsErr>
+ where
+     PcsErr: Debug,
+ {
++    /// A proof cannot choose degrees different from checked public preprocessing.
++    #[error("prepared degree mismatch for AIR {air}: expected {expected}, got {got}")]
++    PreparedDegreeMismatch {
++        air: usize,
++        expected: usize,
++        got: usize,
++    },
+     /// A generic STARK verification failure.
+     #[error(transparent)]
+     Verification(#[from] VerificationError<PcsErr>),
+diff --git a/batch-stark/src/lib.rs b/batch-stark/src/lib.rs
+index 2f8ebe3264682aabf5ba16145a2f575fe9d4c9ea..d2a8476ab0ef6a171d193403d7a3a54d46fb748d 100644
+--- a/batch-stark/src/lib.rs
++++ b/batch-stark/src/lib.rs
+@@ -30,4 +30,4 @@ pub use security::num_batched_openings;
+ pub use transcript::{
+     BatchProverTranscript, BatchShape, BatchTranscriptFailure, BatchVerifierTranscript,
+ };
+-pub use verifier::{VerifierData, verify_batch};
++pub use verifier::{PreparedBatchVerifier, VerifierData, verify_batch};
+diff --git a/batch-stark/src/verifier/mod.rs b/batch-stark/src/verifier/mod.rs
+index 679843a32e73d41fe2d0cfd723accf1ad2d5629b..80a27d87af8c72c490e00c35fce680af47f8ec8b 100644
+--- a/batch-stark/src/verifier/mod.rs
++++ b/batch-stark/src/verifier/mod.rs
+@@ -462,6 +462,149 @@ where
+     ))
+ }
+ 
++fn infer_log_chunks<SC, A>(
++    config: &SC,
++    air: &A,
++    pre_w: usize,
++    base_db: usize,
++    i: usize,
++    lookups: &[p3_lookup::Lookup<Val<SC>>],
++) -> Result<usize, BatchVerificationError<PcsError<SC>>>
++where
++    SC: SGC,
++    Val<SC>: PrimeField64,
++    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SC::Challenge>,
++    A: Air<InteractionSymbolicBuilder<Val<SC>, SC::Challenge>>,
++{
++    let pcs = config.pcs();
++    let layout = AirLayout {
++        preprocessed_width: pre_w,
++        main_width: air.width(),
++        num_public_values: air.num_public_values(),
++        num_periodic_columns: air.num_periodic_columns(),
++        ..Default::default()
++    };
++    // The same symbolic evaluation checks the next-row declaration.
++    // Why: with an empty declaration the next row is never opened, and the constraints fold zeros for it.
++    // An AIR reading such a row would otherwise fail as an opaque evaluation mismatch.
++    let constraints = info_span!("infer log of constraint degree", air_idx = i).in_scope(|| {
++        let evaluated = evaluate_constraints::<_, SC::Challenge, A, _>(
++            air,
++            layout,
++            lookups,
++            &LogUpGadget::new(),
++        );
++        AirConstraints::new(air, evaluated)
++    });
++    constraints
++        .check_next_row_reads()
++        .map_err(|UndeclaredNextRowRead { trace, column }| {
++            VerificationError::UndeclaredNextRowRead {
++                air: Some(i),
++                trace,
++                column,
++            }
++        })?;
++    let log_num_chunks = constraints.log_num_quotient_chunks(
++        pcs.natural_domain_for_degree(1usize << base_db),
++        config.is_zk(),
++    );
++    Ok(log_num_chunks)
++}
++
++struct CachedBatchShape {
++    degree_bits: Vec<usize>,
++    log_num_chunks: Vec<usize>,
++}
++
++/// Public verifier preprocessing for fixed AIRs, common data, configuration and degrees.
++///
++/// Owns its inputs so a caller cannot combine checked metadata with a different
++/// AIR, lookup graph, preprocessing root or PCS configuration. Each verification
++/// still checks proof shape, replays a fresh transcript and verifies all openings
++/// and constraint equalities. This type never accepts metadata from a proof.
++pub struct PreparedBatchVerifier<SC: SGC, A> {
++    config: SC,
++    airs: Vec<A>,
++    common: CommonData<SC>,
++    shape: CachedBatchShape,
++}
++
++impl<SC, A> PreparedBatchVerifier<SC, A>
++where
++    SC: SGC,
++    Val<SC>: PrimeField64,
++    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SC::Challenge>,
++    A: Air<InteractionSymbolicBuilder<Val<SC>, SC::Challenge>>
++        + for<'a> Air<VerifierConstraintFolderWithLookups<'a, SC>>,
++    Challenge<SC>: BasedVectorSpace<Val<SC>>,
++    SC::Challenger: GrindingChallenger<Witness = Val<SC>>,
++{
++    pub fn new(
++        config: SC,
++        airs: Vec<A>,
++        common: CommonData<SC>,
++        degree_bits: Vec<usize>,
++    ) -> Result<Self, BatchVerificationError<PcsError<SC>>> {
++        if airs.len() != degree_bits.len()
++            || airs.len() != common.lookups.len()
++            || common
++                .preprocessed
++                .as_ref()
++                .is_some_and(|p| p.instances.len() != airs.len())
++        {
++            return Err(InvalidProofShapeError::InstanceCountMismatch.into());
++        }
++        let mut log_num_chunks = Vec::with_capacity(airs.len());
++        for (i, air) in airs.iter().enumerate() {
++            let (base_db, _) = validate_degree_bits(
++                Some(i),
++                degree_bits[i],
++                config.is_zk(),
++                config.pcs().log_min_trace_height(),
++                config.pcs().log_max_trace_height(),
++            )?;
++            let pre_w = common
++                .preprocessed
++                .as_ref()
++                .and_then(|p| p.instances[i].as_ref())
++                .map_or(0, |p| p.width);
++            log_num_chunks.push(infer_log_chunks(
++                &config,
++                air,
++                pre_w,
++                base_db,
++                i,
++                &common.lookups[i],
++            )?);
++        }
++        Ok(Self {
++            config,
++            airs,
++            common,
++            shape: CachedBatchShape {
++                degree_bits,
++                log_num_chunks,
++            },
++        })
++    }
++
++    pub fn verify(
++        &self,
++        proof: &BatchProof<SC>,
++        public_values: &[Vec<Val<SC>>],
++    ) -> Result<(), BatchVerificationError<PcsError<SC>>> {
++        verify_batch_inner(
++            &self.config,
++            &self.airs,
++            proof,
++            public_values,
++            &self.common,
++            Some(&self.shape),
++        )
++    }
++}
++
+ #[instrument(skip_all)]
+ pub fn verify_batch<SC, A>(
+     config: &SC,
+@@ -470,6 +613,27 @@ pub fn verify_batch<SC, A>(
+     public_values: &[Vec<Val<SC>>],
+     common: &CommonData<SC>,
+ ) -> Result<(), BatchVerificationError<PcsError<SC>>>
++where
++    SC: SGC,
++    Val<SC>: PrimeField64,
++    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SC::Challenge>,
++    A: Air<InteractionSymbolicBuilder<Val<SC>, SC::Challenge>>
++        + for<'a> Air<VerifierConstraintFolderWithLookups<'a, SC>>,
++    Challenge<SC>: BasedVectorSpace<Val<SC>>,
++    SC::Challenger: GrindingChallenger<Witness = Val<SC>>,
++{
++    verify_batch_inner(config, airs, proof, public_values, common, None)
++}
++
++#[instrument(skip_all)]
++fn verify_batch_inner<SC, A>(
++    config: &SC,
++    airs: &[A],
++    proof: &BatchProof<SC>,
++    public_values: &[Vec<Val<SC>>],
++    common: &CommonData<SC>,
++    prepared: Option<&CachedBatchShape>,
++) -> Result<(), BatchVerificationError<PcsError<SC>>>
+ where
+     SC: SGC,
+     Val<SC>: PrimeField64,
+@@ -517,6 +681,18 @@ where
+         return Err(InvalidProofShapeError::InstanceCountMismatch.into());
+     }
+ 
++    if let Some(prepared) = prepared {
++        for (i, (&got, &expected)) in degree_bits.iter().zip(&prepared.degree_bits).enumerate() {
++            if got != expected {
++                return Err(BatchVerificationError::PreparedDegreeMismatch {
++                    air: i,
++                    expected,
++                    got,
++                });
++            }
++        }
++    }
++
+     // The challenge layout reads one payload width per lookup.
+     // Common data built from the AIRs already agrees, but the verifier does not rely on that.
+     for lookups in all_lookups {
+@@ -553,39 +729,11 @@ where
+             .unwrap_or(0);
+         preprocessed_widths.push(pre_w);
+ 
+-        let layout = AirLayout {
+-            preprocessed_width: pre_w,
+-            main_width: air.width(),
+-            num_public_values: air.num_public_values(),
+-            num_periodic_columns: air.num_periodic_columns(),
+-            ..Default::default()
++        let log_num_chunks = if let Some(prepared) = prepared {
++            prepared.log_num_chunks[i]
++        } else {
++            infer_log_chunks(config, air, pre_w, base_db, i, &all_lookups[i])?
+         };
+-        // The same symbolic evaluation checks the next-row declaration.
+-        // Why: with an empty declaration the next row is never opened, and the constraints fold zeros for it.
+-        // An AIR reading such a row would otherwise fail as an opaque evaluation mismatch.
+-        let constraints =
+-            info_span!("infer log of constraint degree", air_idx = i).in_scope(|| {
+-                let evaluated = evaluate_constraints::<_, SC::Challenge, A, _>(
+-                    air,
+-                    layout,
+-                    &all_lookups[i],
+-                    &lookup_gadget,
+-                );
+-                AirConstraints::new(air, evaluated)
+-            });
+-        constraints
+-            .check_next_row_reads()
+-            .map_err(|UndeclaredNextRowRead { trace, column }| {
+-                VerificationError::UndeclaredNextRowRead {
+-                    air: Some(i),
+-                    trace,
+-                    column,
+-                }
+-            })?;
+-        let log_num_chunks = constraints.log_num_quotient_chunks(
+-            pcs.natural_domain_for_degree(1usize << base_db),
+-            config.is_zk(),
+-        );
+         log_num_quotient_chunks.push(log_num_chunks);
+ 
+         let (_, n_chunks) =

@@ -1,0 +1,3 @@
+dependencies/*.patch -whitespace
+crates/mpc/src/sha_frozen/*.bin binary
+crates/mpc/src/generated_sha.rs text eol=lf

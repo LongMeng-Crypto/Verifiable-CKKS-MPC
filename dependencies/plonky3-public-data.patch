@@ -1,0 +1,17 @@
+diff --git a/fri/src/hiding_pcs.rs b/fri/src/hiding_pcs.rs
+index 02e026739bddc448168fcf58e81140f8bf2d8e72..ee1935edb4c72e13ab4595d93a3d4e994daba1ac 100644
+--- a/fri/src/hiding_pcs.rs
++++ b/fri/src/hiding_pcs.rs
+@@ -108,6 +108,12 @@ pub struct HidingFriPcsProverData<T> {
+ }
+ 
+ impl<T> HidingFriPcsProverData<T> {
++    /// Exposes reusable public preprocessing data for opening reconstruction.
++    /// Private masked data is deliberately never exposed through this accessor.
++    pub fn public_preprocessing_data(&self) -> Option<&T> {
++        self.preprocessed.then_some(&self.inner)
++    }
++
+     fn new(inner: T, preprocessed: bool, num_random_codewords: usize, log_blowup: usize) -> Self {
+         Self {
+             inner,

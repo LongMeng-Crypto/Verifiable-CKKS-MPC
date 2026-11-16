@@ -1,0 +1,64 @@
+diff --git a/fri/src/periodic.rs b/fri/src/periodic.rs
+index 2233c7887c75be4d6b34254de76bdc2a76b8a35b..90242c76de0e982e500a7b9964acb87d8119be9b 100644
+--- a/fri/src/periodic.rs
++++ b/fri/src/periodic.rs
+@@ -33,6 +33,7 @@ use p3_commit::{PeriodicColumns, PeriodicEvaluator, PeriodicLdeTable};
+ use p3_dft::TwoAdicSubgroupDft;
+ use p3_field::coset::TwoAdicMultiplicativeCoset;
+ use p3_field::{ExtensionField, TwoAdicField};
++use p3_matrix::Matrix;
+ use p3_matrix::dense::RowMajorMatrix;
+ use p3_util::log2_strict_usize;
+ 
+@@ -120,34 +121,25 @@ impl<Dft> TwoAdicPeriodicEvaluator<Dft> {
+         // So extended_height divides lde_len.
+         let periodic_shift = lde_shift.exp_u64((lde_len / extended_height) as u64);
+ 
+-        // Process each column: pad to max_period, then extrapolate
+-        // Build the result in column-major order first, then transpose to row-major
+-        let mut columns: Vec<Vec<F>> = Vec::with_capacity(num_cols);
+-
+-        for col in periodic_table.as_slice() {
+-            let period = col.len();
+-
+-            // Pad column to max_period by repeating values
+-            let padded: Vec<F> = if period == max_period {
+-                col.clone()
+-            } else {
+-                (0..max_period).map(|i| col[i % period]).collect()
+-            };
+-
+-            // Extrapolate to extended_height using DFT
+-            let extended = dft.coset_lde(padded, log_blowup, periodic_shift);
+-            columns.push(extended);
+-        }
+-
+-        // Convert from column-major to row-major storage
+-        let mut row_major_values = Vec::with_capacity(row_major_capacity);
+-        for row_idx in 0..extended_height {
+-            for col in &columns {
+-                row_major_values.push(col[row_idx]);
++        // Extend every column in one matrix transform. Independent one-column
++        // transforms repeat allocation, scheduling and transposition for each
++        // public selector, which dominates small traces with wide periodic tables.
++        // Repetition to max_period defines exactly the same polynomial per column.
++        let mut values = Vec::with_capacity(max_period * num_cols);
++        for row in 0..max_period {
++            for column in periodic_table.as_slice() {
++                values.push(column[row % column.len()]);
+             }
+         }
+-
+-        PeriodicLdeTable::new(RowMajorMatrix::new(row_major_values, num_cols))
++        let extended = dft
++            .coset_lde_batch(
++                RowMajorMatrix::new(values, num_cols),
++                log_blowup,
++                periodic_shift,
++            )
++            .to_row_major_matrix();
++        debug_assert_eq!(extended.values.len(), row_major_capacity);
++        PeriodicLdeTable::new(extended)
+     }
+ }
+ 

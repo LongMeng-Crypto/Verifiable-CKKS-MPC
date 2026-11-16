@@ -1,0 +1,100 @@
+diff --git a/merkle-tree/src/hiding_mmcs.rs b/merkle-tree/src/hiding_mmcs.rs
+index beb10c24b3258d9b7018606783ae3e5cd60cbad4..f7cd1beb283e383be85fcda137b2d5f421d6616f 100644
+--- a/merkle-tree/src/hiding_mmcs.rs
++++ b/merkle-tree/src/hiding_mmcs.rs
+@@ -1,4 +1,6 @@
++use alloc::vec;
+ use alloc::vec::Vec;
++use p3_maybe_rayon::prelude::*;
+ 
+ use itertools::Itertools;
+ use p3_commit::{BatchOpening, BatchOpeningRef, HidingMmcs, Mmcs};
+@@ -9,7 +11,7 @@ use p3_matrix::{Dimensions, Matrix};
+ use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
+ use p3_util::zip_eq::zip_eq;
+ use rand::distr::{Distribution, StandardUniform};
+-use rand::{CryptoRng, SeedableRng};
++use rand::{CryptoRng, RngExt, SeedableRng};
+ use serde::de::DeserializeOwned;
+ use serde::{Deserialize, Serialize};
+ use spin::Mutex;
+@@ -51,6 +53,7 @@ pub struct MerkleTreeHidingMmcs<
+ > {
+     inner: MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>,
+     rng: Mutex<R>,
++    parallel_salts: bool,
+ }
+ 
+ impl<P, PW, H, C, R, const N: usize, const DIGEST_ELEMS: usize, const SALT_ELEMS: usize>
+@@ -80,9 +83,18 @@ impl<P, PW, H, C, R, const N: usize, const DIGEST_ELEMS: usize, const SALT_ELEMS
+         Self {
+             inner,
+             rng: Mutex::new(rng),
++            parallel_salts: false,
+         }
+     }
+ 
++    /// Opt in to indexed independent CSPRNG salt substreams. The default
++    /// preserves the original sequential stream exactly. Seed allocation is
++    /// deterministic in matrix/chunk order and finishes before Rayon starts.
++    pub const fn with_parallel_salts(mut self, enabled: bool) -> Self {
++        self.parallel_salts = enabled;
++        self
++    }
++
+     pub const fn cap_height(&self) -> usize {
+         self.inner.cap_height()
+     }
+@@ -101,6 +113,7 @@ where
+         Self {
+             inner: self.inner.clone(),
+             rng: Mutex::new(R::from_rng(&mut *self.rng.lock())),
++            parallel_salts: self.parallel_salts,
+         }
+     }
+ }
+@@ -163,6 +176,44 @@ where
+         &self,
+         inputs: Vec<M>,
+     ) -> (Self::Commitment, Self::ProverData<M>) {
++        if self.parallel_salts {
++            // 2 MiB of u64 field elements per task. Every child receives a fresh
++            // seed; never duplicate an RNG state or reuse a private salt stream.
++            const CHUNK_VALUES: usize = 1 << 18;
++            let jobs: Vec<_> = {
++                let mut parent = self.rng.lock();
++                inputs
++                    .into_iter()
++                    .map(|mat| {
++                        let len = mat
++                            .height()
++                            .checked_mul(SALT_ELEMS)
++                            .expect("salt size overflow");
++                        let children: Vec<_> = (0..len.div_ceil(CHUNK_VALUES))
++                            .map(|_| R::from_rng(&mut *parent))
++                            .collect();
++                        (mat, len, children)
++                    })
++                    .collect()
++            };
++            // No RNG lock is held while a worker can execute nested Rayon work.
++            let salted_inputs = jobs
++                .into_iter()
++                .map(|(mat, len, children)| {
++                    let mut values = vec![P::Value::default(); len];
++                    values
++                        .par_chunks_mut(CHUNK_VALUES)
++                        .zip(children.into_par_iter())
++                        .for_each(|(chunk, mut rng)| {
++                            for value in chunk {
++                                *value = rng.random();
++                            }
++                        });
++                    HorizontalPair::new(mat, RowMajorMatrix::new(values, SALT_ELEMS))
++                })
++                .collect();
++            return self.inner.commit(salted_inputs);
++        }
+         // Draw every salt under the lock, then release it before hashing.
+         //
+         // Why: tree building is parallel.
