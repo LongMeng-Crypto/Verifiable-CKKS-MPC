@@ -1,5 +1,25 @@
 # Verifiable CKKS MPC
 
+## Cryptographic parameters
+
+| Parameter | Value |
+| --- | --- |
+| Parties / threshold | 2 parties, 2-of-2 |
+| Ring | `F_q[X]/(X^N+1)`, `N=4096` |
+| Modulus q | `18446744069414584321 = 2^64 - 2^32 + 1` (Goldilocks) |
+| Secret per party | Sparse ternary; exact Hamming weight 256; uniform support and signs |
+| Encryption randomness | Uniform ternary; no fixed Hamming weight |
+| Small errors | Truncated discrete Gaussian, sigma `16/5`; coefficient bound `[-26,26]` |
+| Decryption flooding per party | Truncated discrete Gaussian, sigma `2^55*sqrt(2)`; bound `[-366857376337484500,366857376337484500]` |
+| Message domain | Provisional digits modulo 8; V2 proves every coefficient is in `0..7`; V1 has no message-range constraint |
+| Plaintext lift | `kappa=(q-1)/8=2305843008676823040` (**provisional**) |
+| V1 key commitment | SHA-256 with a private 32-byte salt; 17 compression blocks at N4096 |
+| Challenge field | `F_q[Z]/(Z^3-Z-1)`; conservative field size 191 bits |
+| Backend hashes | Full SHA-256 for Merkle leaves, nodes, and transcript |
+| Hiding PCS | Plonky3 HidingFriPcs; 3 random codewords; 4 field-element salts per Merkle leaf |
+| FRI profiles | B8/Q100 or B16/Q75; maximum folding arity 8; final polynomial length 64; zero grinding |
+| Proof security target | Proven RBR >=128 classical bits; non-hash LDR terms >=144 bits, under the upstream analysis |
+
 Research implementation of two-party CKKS KeyGen, encryption, and decryption
 relations using a hiding Plonky3 STARK. The retained implementations are:
 
@@ -164,39 +184,18 @@ without changing their original manifests or proof files. Development checks use
 four Rayon workers; the observed full-suite peak is approximately 3.24 GiB.
 These checks are correctness evidence, not new eight-thread performance results.
 
-## Adding single-limb bootstrapping
+## single limb bootstrapping
 
-The bootstrapping computation can be shared by V1 and V2: these variants differ
-in secret-key binding, not in the ring/ciphertext arithmetic. A V2-only proof
-extension can be developed first without duplicating the computational engine.
-There is currently no bootstrapping implementation or bootstrapping-key generator.
-
-| File or new module | Integration work |
+| File | Work |
 | --- | --- |
-| `crates/mpc/src/arithmetic.rs` | Reuse ring arithmetic and NTTs; introduce the required encoding, scale, rounding, and decoding conventions. |
-| New `crates/mpc/src/bootstrap.rs` | Implement the single-limb bootstrap or refresh engine and time its key setup, evaluation, and memory independently. |
-| `crates/mpc/src/protocol.rs` | Define explicit bootstrap parameters, evaluation-key/public-input types, and input/output bindings; extend the currently frozen parameter validation deliberately. |
-| `crates/mpc/src/bench.rs` | Insert bootstrapping into the reference workflow and add phase metrics. Update `check_workflow`, which currently requires the approved ciphertext to equal the sum of the two ENC ciphertexts. |
-| `crates/mpc/src/bin/vmpckks-prover-bench.rs` | Add controlled before/after bootstrapping cases and independent verification. |
-| `crates/mpc/src/specialized.rs` and `circuit.rs` | Add bootstrap constraints and authenticated wire connections only if bootstrapping correctness itself must be proved. |
-| `crates/mpc/src/backend.rs` and `fri_profile.rs` | Recount security and hiding/opening budgets for any new proof AIR. |
+| New `crates/mpc/src/bootstrap.rs` | Implement single-limb bootstrapping and evaluation-key operations. |
+| `crates/mpc/src/arithmetic.rs` | Reuse ring arithmetic/NTTs; add the required encoding, scale, and rounding. |
+| `crates/mpc/src/protocol.rs` | Define bootstrap parameters, evaluation keys, ciphertext interfaces, and key/input/output bindings. |
+| `crates/mpc/src/bench.rs` | Integrate bootstrapping and phase timings; update `check_workflow`, which currently requires ciphertext-addition output. |
+| `crates/mpc/src/bin/vmpckks-prover-bench.rs` | Add before/after bootstrapping cases and result statistics. |
 
-First settle whether the desired operation is server-side homomorphic CKKS
-bootstrapping using evaluation keys, or interactive threshold decrypt/re-encrypt
-refresh. These are different protocols. The current digit-lift demo does not
-supply the CKKS encoding, scale/noise schedule, approximate modular reduction,
-or evaluation keys required by a complete CKKS bootstrap. Any necessary change
-to q, N, distributions, or encoding needs an explicit new parameter profile and
-correctness/security analysis; the existing benchmark numbers do not cover it.
-
-A computation-only benchmark can reuse the current KG/ENC/DEC proofs while
-measuring bootstrapping separately, but that does not prove the intermediate
-bootstrapping step. To make server evaluation verifiable, add a dedicated
-input-to-output relation and bind it into the workflow instead of bypassing the
-existing ciphertext checks. Bootstrap keys must be tied to the enrolled key;
-revealing a secret key to the server is not a bootstrap-key interface.
-
-For an initial V2-only proof integration, preserve the registered-PK opening in
-DEC and implement the new bootstrap relation beside it. V1's periodic SHA module
-and generated polynomial evaluator need no changes unless secret-key binding or
-its authenticated encoding changes.
+The computation can be shared by V1 and V2 without changing the SHA modules.
+For a bootstrapping correctness proof, also extend `specialized.rs` and
+`circuit.rs`, then recount security in `backend.rs` and `fri_profile.rs`.
+Implement the computation first; prioritize V2 for proof integration. Confirm
+the CKKS encoding/scale conventions, since the current digit lift is provisional.
